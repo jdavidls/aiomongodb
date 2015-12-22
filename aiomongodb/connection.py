@@ -5,23 +5,39 @@
 import struct, collections, asyncio
 
 
-__all__ = 'Connection', 'ReplyError', 'CursorNotFound', \
-	'QueryFailure', 'ConnectionLost'
+__all__ = 'Connection', 'Reply', 'ConnectionLost'
 
-class ReplyError(Exception):
+#class Connection
+
+class ConnectionLost(Exception):
 	pass
 
-class CursorNotFound(ReplyError):
-	pass
 
-class QueryFailure(ReplyError):
-	pass
+Reply = collections.namedtuple('Reply',	[
+	'cursor_not_found',
+	'query_failure',
+	'shard_config_stale',
+	'await_capable',
+	'cursor_id',
+	'starting_from',
+	'number_returned',
+	'bson_payload'
+])
 
-class ConnectionLost(ReplyError):
-	pass
-
+default_host = 'localhost'
+default_port = 27017
+unpack_reply = struct.Struct('<iiii iqii').unpack	# 36 bytes
+pack_request = struct.Struct('<iiii i').pack		# 20 bytes
+pack_update = struct.Struct('<xi').pack				# 5 bytes
+pack_query = struct.Struct('<xii').pack				# 9 bytes
+pack_get_more = struct.Struct('<xiq').pack			# 13 bytes
+pack_delete = struct.Struct('<xi').pack				# 5 bytes
+pack_kill_cursors = struct.Struct('<i').pack		# 4 bytes
+pack_cursor = struct.Struct('<q').pack				# 8 bytes
+join_bytes = b''.join
 
 class ChunkBuffer:
+	' helper fifo structure '
 	def __init__(self):
 		self._deque = collections.deque()
 		self._length = 0
@@ -33,7 +49,7 @@ class ChunkBuffer:
 		self._deque.append(chunk)
 		self._length += len(chunk)
 
-	def extract(self, length, joiner=b''.join):
+	def extract(self, length):
 		if self._length < length:
 			return None
 
@@ -57,24 +73,14 @@ class ChunkBuffer:
 
 		chunks.append(chunk)
 
-		return joiner(chunks)
+		return join_bytes(chunks)
 
-
-unpack_reply = struct.Struct('<iiii iqii').unpack	# 36 bytes
-pack_request = struct.Struct('<iiii i').pack		# 20 bytes
-pack_update = struct.Struct('<xi').pack				# 5 bytes
-pack_query = struct.Struct('<xii').pack				# 9 bytes
-pack_get_more = struct.Struct('<xiq').pack			# 13 bytes
-pack_delete = struct.Struct('<xi').pack				# 5 bytes
-pack_kill_cursors = struct.Struct('<i').pack		# 4 bytes
-pack_cursor = struct.Struct('<q').pack				# 8 bytes
-join_bytes = b''.join
 
 class Connection(asyncio.Protocol):
-	def __init__(self, host='localhost', port=27017, loop=None):
-		self._host = host
-		self._port = port
+	def __init__(self, loop=None, host=None, port=None):
 		self._loop = loop or asyncio.get_event_loop()
+		self._host = host or default_host
+		self._port = port or default_port
 
 		self._connection_future = None
 		self._disconnection_future = None
@@ -92,11 +98,17 @@ class Connection(asyncio.Protocol):
 	#		self._loop.create_task(self.disconnect())
 
 	async def connect(self):
+		'''
+			returns a disconnection future
+		'''
 		if not self._is_connected:
 			self._connection_future = asyncio.Future()
 			self._disconnection_future = asyncio.Future()
 			await self._loop.create_connection(lambda: self, self._host, self._port)
 			await self._connection_future
+
+		return self._disconnection_future
+
 
 	async def disconnect(self):
 		if self._transport:
@@ -117,25 +129,23 @@ class Connection(asyncio.Protocol):
 
 		# authentication here
 
-		self._connection_future.set_result(None)
+		self._connection_future.set_result(self)
 
 
 	def connection_lost(self, exc):
-
 		self._transport = None
 		self._is_connected = False
+		self._chunk_buffer = None
+		self._current_reply = None
 
-		# lanzar retries??
-		if exc:
-			for future in self._request_futures:
-				future.set_exception(exc)
-		else:
-			for future in self._request_futures:
-				future.cancel() # cancel or connection lost?
+		# lanza ConnectionLost
+		exception = ConnectionLost(exc)
+		for future in self._request_futures:
+			future.set_exception(exception)
 		self._request_futures = {}
 
-		# TODO if reconnect->reconnect
-		self._disconnection_future.set_result(None)
+		self._disconnection_future.set_result(self)
+
 
 	def data_received(self, chunk):
 		append_to_chunk_buffer = self._chunk_buffer.append
@@ -171,36 +181,49 @@ class Connection(asyncio.Protocol):
 
 			if payload_length:
 				payload_data = extract_from_chunk_buffer(payload_length)
-				if payload_data is None:
+				if payload_data is None: ## await for payload
 					self._current_reply = reply
-					return ## awaiting current reply
+					return
 			else:
 				payload_data = b''
 
 			request_future = self._request_futures.get(response_to, None)
 
-			if request_future is None:
+
+			if request_future is None: ## ignores current reply
+				### TODO: Exhaust queries can match by cursor_id -> future
+				###
 				reply = None
-				continue ## ignores current reply
+				continue
 
-			if response_flags & 1: # CursorNotFound
-				request_future.set_exception( CursorNotFound((reply, payload_data)) )
+			request_future.set_result(Reply(
+				bool(response_flags & 1),
+				bool(response_flags & 2),
+				bool(response_flags & 4),
+				bool(response_flags & 8),
+				cursor_id,
+				starting_from,
+				number_returned,
+				payload_data,
+			))
+			# if response_flags & 1: # CursorNotFound
+			# 	request_future.set_exception( CursorNotFound(result) )
+			# elif response_flags & 2: # QueryFailure future.set_exception
+			# 	request_future.set_exception( QueryFailure(result) )
+			#
+			# elif response_flags & 4: # ShardConfigStale -- ignored for now
+			# elif response_flags & 8: # AwaitCapable -- ignored for now
 
-			if response_flags & 2: # QueryFailure future.set_exception
-				request_future.set_exception( QueryFailure((reply, payload_data)) )
-
-			#if response_flags & 4: # ShardConfigStale -- ignored for now
-			#if response_flags & 8: # AwaitCapable -- ignored for now
-
-			request_future.set_result((reply, payload_data))
 
 	def _send_request(self, *chunks):
 		self._transport.write(join_bytes(chunks))
 
 		request_id = self._next_request_id
+		self._next_request_id = (request_id + 1) & 0xFFFFFFFF
+
 		request_future = asyncio.Future()
 		self._request_futures[request_id] = request_future
-		self._next_request_id = (request_id + 1) & 0xFFFFFFFF
+
 		return request_future
 
 
@@ -235,7 +258,7 @@ class Connection(asyncio.Protocol):
 			documents,
 		)
 
-	def OP_QUERY(self, collection, query, count, skip=0, selector=b'',
+	def OP_QUERY(self, collection, query, selector, count, skip,
 			tailable_cursor=False, await_data=False, exhaust=False):
 		return self._send_request(
 			pack_request(
